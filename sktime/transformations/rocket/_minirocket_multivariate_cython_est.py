@@ -145,14 +145,9 @@ class MiniRocketMultivariateCython(BaseTransformer):
         -------
         self
         """
-        X = X.astype(np.float32)
-        _, n_columns, n_timepoints = X.shape
-        if n_timepoints < 9:
-            raise ValueError(
-                f"n_timepoints must be >= 9, but found {n_timepoints};"
-                " zero pad shorter series so that n_timepoints == 9"
-            )
-        self.parameters = self._fit_params(
+        from sktime_cython.transformations.rocket import rocket_fit
+
+        self.parameters = rocket_fit(
             X, self.num_kernels, self.max_dilations_per_kernel, self.random_state_
         )
         if self.num_kernels < 84:
@@ -161,92 +156,6 @@ class MiniRocketMultivariateCython(BaseTransformer):
             self.num_kernels_ = (self.num_kernels // 84) * 84
 
         return self
-
-    @staticmethod
-    def _fit_params(X, num_features, max_dilations_per_kernel, seed):
-        """Pure-numpy + Cython fit, equivalent to numba ``_fit_multi``."""
-        # reuse the non-numba fit scaffolding from the numba module
-        from sktime_cython.transformations.rocket import (
-            _minirocket_multivariate_cython as _cy,
-        )
-        from sktime_cython.transformations.rocket._minirocket import (
-            _fit_dilations,
-            _quantiles,
-        )
-
-        if seed is not None:
-            np.random.seed(seed)
-
-        _, n_columns, n_timepoints = X.shape
-        num_kernels = 84
-
-        dilations, num_features_per_dilation = _fit_dilations(
-            n_timepoints, num_features, max_dilations_per_kernel
-        )
-        num_features_per_kernel = np.sum(num_features_per_dilation)
-        quantiles = _quantiles(num_kernels * num_features_per_kernel)
-
-        num_dilations = len(dilations)
-        num_combinations = num_kernels * num_dilations
-
-        max_num_channels = min(n_columns, 9)
-        max_exponent = np.log2(max_num_channels + 1)
-
-        num_channels_per_combination = (
-            2 ** np.random.uniform(0, max_exponent, num_combinations)
-        ).astype(np.int32)
-
-        channel_indices = np.zeros(num_channels_per_combination.sum(), dtype=np.int32)
-        num_channels_start = 0
-        for combination_index in range(num_combinations):
-            n_this = num_channels_per_combination[combination_index]
-            num_channels_end = num_channels_start + n_this
-            channel_indices[num_channels_start:num_channels_end] = np.random.choice(
-                n_columns, n_this, replace=False
-            )
-            num_channels_start = num_channels_end
-
-        # biases: re-seed (matching numba _fit_biases_multi), draw one instance
-        # index per combination, build C in Cython, then quantile per combination.
-        if seed is not None:
-            np.random.seed(seed)
-        n_instances = X.shape[0]
-        instance_indices = np.array(
-            [np.random.randint(n_instances) for _ in range(num_combinations)],
-            dtype=np.int32,
-        )
-        C = _cy.fit_biases(
-            np.ascontiguousarray(X, dtype=np.float32),
-            num_channels_per_combination,
-            channel_indices,
-            dilations.astype(np.int32),
-            num_features_per_dilation.astype(np.int32),
-            instance_indices,
-        )
-
-        biases = np.zeros(
-            num_kernels * int(np.sum(num_features_per_dilation)), dtype=np.float32
-        )
-        feature_index_start = 0
-        combination_index = 0
-        for dilation_index in range(num_dilations):
-            nfd = num_features_per_dilation[dilation_index]
-            for _kernel_index in range(num_kernels):
-                feature_index_end = feature_index_start + nfd
-                biases[feature_index_start:feature_index_end] = np.quantile(
-                    C[combination_index],
-                    quantiles[feature_index_start:feature_index_end],
-                ).astype(np.float32)
-                feature_index_start = feature_index_end
-                combination_index += 1
-
-        return (
-            num_channels_per_combination,
-            channel_indices,
-            dilations.astype(np.int32),
-            num_features_per_dilation.astype(np.int32),
-            biases,
-        )
 
     def _transform(self, X, y=None):
         """Transform input time series.
@@ -261,39 +170,9 @@ class MiniRocketMultivariateCython(BaseTransformer):
         -------
         pandas DataFrame, transformed features
         """
-        import multiprocessing
-        from concurrent.futures import ThreadPoolExecutor
+        from sktime_cython.transformations.rocket import rocket_transform
 
-        from sktime_cython.transformations.rocket import (
-            _minirocket_multivariate_cython as _cy,
-        )
-
-        X = np.ascontiguousarray(X, dtype=np.float32)
-
-        n_instances = X.shape[0]
-        if self.n_jobs < 1 or self.n_jobs > multiprocessing.cpu_count():
-            n_jobs = multiprocessing.cpu_count()
-        else:
-            n_jobs = self.n_jobs
-        n_jobs = min(n_jobs, n_instances)
-
-        if n_jobs <= 1:
-            X_ = _cy.transform(X, *self.parameters)
-        else:
-            # the Cython kernel releases the GIL, so plain threads run truly
-            # in parallel across disjoint instance chunks.
-            bounds = np.linspace(0, n_instances, n_jobs + 1).astype(int)
-            chunks = [
-                np.ascontiguousarray(X[bounds[i] : bounds[i + 1]])
-                for i in range(n_jobs)
-                if bounds[i + 1] > bounds[i]
-            ]
-            with ThreadPoolExecutor(max_workers=n_jobs) as ex:
-                parts = list(
-                    ex.map(lambda c: _cy.transform(c, *self.parameters), chunks)
-                )
-            X_ = np.vstack(parts)
-        return pd.DataFrame(X_)
+        return pd.DataFrame(rocket_transform(X, self.parameters, self.n_jobs))
 
     @classmethod
     def get_test_params(cls, parameter_set="default"):
